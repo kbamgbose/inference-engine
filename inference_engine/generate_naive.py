@@ -16,6 +16,14 @@ def synchronize(device):
 def main():
     parser = argparse.ArgumentParser(description="Naive full-prefix greedy generation")
     parser.add_argument(
+        "--use-kv-cache", action="store_true",
+        help="Reuse attention keys and values during generation",
+    )
+    parser.add_argument(
+        "--inspect-kv-cache", action="store_true",
+        help="Inspect the prompt cache and verify one cached continuation, then exit",
+    )
+    parser.add_argument(
         "--device", choices=("cpu", "cuda", "mps"), default="cpu",
         help="Execution backend (default: cpu)",
     )
@@ -48,9 +56,57 @@ def main():
     # This excludes buffers, activations, and runtime overhead; it is not peak memory.
     print(f"Parameter storage: {parameter_bytes / 1024**2:.2f} MiB")
 
+    if args.inspect_kv_cache:
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        with torch.inference_mode():
+            outputs = model(input_ids=prompt_tensor, use_cache=True, return_dict=True)
+        cache = outputs.past_key_values
+        assert cache is not None
+        assert len(cache.layers) == model.config.n_layer
+        assert cache.get_seq_length() == len(prompt_ids)
+        first_layer = cache.layers[0]
+        expected_shape = (
+            1, model.config.n_head, len(prompt_ids),
+            model.config.n_embd // model.config.n_head,
+        )
+        assert tuple(first_layer.keys.shape) == expected_shape
+        assert tuple(first_layer.values.shape) == expected_shape
+        print(f"Cache type: {type(cache).__name__}")
+        print(f"Cached layers: {len(cache.layers)}")
+        print(f"Cached token positions: {cache.get_seq_length()}")
+        print(f"First-layer keys shape: {tuple(first_layer.keys.shape)}")
+        print(f"First-layer values shape: {tuple(first_layer.values.shape)}")
+        print(f"Cache dtype: {first_layer.keys.dtype}")
+
+        # Reuse the prompt cache for exactly one new token, then compare scores.
+        with torch.inference_mode():
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            cached_outputs = model(
+                input_ids=next_token, past_key_values=cache,
+                use_cache=True, return_dict=True,
+            )
+            full_prefix = torch.cat((prompt_tensor, next_token), dim=1)
+            reference = model(input_ids=full_prefix, use_cache=False, return_dict=True)
+            cached_scores = cached_outputs.logits[:, -1, :]
+            reference_scores = reference.logits[:, -1, :]
+            torch.testing.assert_close(
+                cached_scores, reference_scores, rtol=1e-4, atol=1e-4
+            )
+            assert torch.equal(cached_scores.argmax(-1), reference_scores.argmax(-1))
+        cache = cached_outputs.past_key_values
+        assert cache.get_seq_length() == len(prompt_ids) + 1
+        print(f"Token fed into cached call: {tokenizer.decode(next_token[0].tolist())!r}")
+        print(f"Cached call input length: {next_token.shape[1]}")
+        print(f"Cached token positions after reuse: {cache.get_seq_length()}")
+        print("Cached and full-prefix scores agree within tolerance; greedy IDs match")
+        return
+
     max_new_tokens = 10
     stop_reason = "generation limit"
     trace = []
+    cache = None
+    forwarded_lengths = []
 
     # Local request timing: tokenization through final decoding, with model loaded.
     synchronize(device)
@@ -74,13 +130,26 @@ def main():
                 stop_reason = "context limit"
                 break
 
-            outputs = model(input_ids=input_tensor, use_cache=False, return_dict=True)
+            if args.use_kv_cache:
+                # Prefill once; then forward only the token not yet in the cache.
+                model_input = input_tensor if cache is None else input_tensor[:, -1:]
+                outputs = model(
+                    input_ids=model_input, past_key_values=cache,
+                    use_cache=True, return_dict=True,
+                )
+                cache = outputs.past_key_values
+                assert cache is not None
+                assert cache.get_seq_length() == prefix_length
+            else:
+                model_input = input_tensor
+                outputs = model(input_ids=model_input, use_cache=False, return_dict=True)
+                assert outputs.past_key_values is None
+            forwarded_lengths.append(model_input.shape[1])
             logits = outputs.logits
-            expected_shape = (1, prefix_length, model.config.vocab_size)
+            expected_shape = (1, model_input.shape[1], model.config.vocab_size)
             assert tuple(logits.shape) == expected_shape
             assert torch.isfinite(logits).all().item(), "Logits contain NaN or infinity"
             assert not logits.requires_grad
-            assert outputs.past_key_values is None
 
             # The last input position predicts the token after the current prefix.
             next_token_logits = logits[:, -1, :]
@@ -115,6 +184,30 @@ def main():
     assert 0 < generation_seconds <= request_seconds
 
     # Decode and print diagnostics after stopping both timers.
+    print(f"KV cache enabled: {args.use_kv_cache}")
+    print(f"Tokens forwarded per call: {forwarded_lengths}")
+    if cache is not None:
+        cached_positions = cache.get_seq_length()
+        # Count logical tensor payload after timing, independently of the formula.
+        actual_cache_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for layer in cache.layers
+            for tensor in (layer.keys, layer.values)
+        )
+        bytes_per_value = cache.layers[0].keys.element_size()
+        head_dimension = model.config.n_embd // model.config.n_head
+        bytes_per_token = (
+            2 * model.config.n_layer * model.config.n_head
+            * head_dimension * bytes_per_value
+        )
+        # This formula assumes GPT-2's uniform K/V layout and precision.
+        expected_cache_bytes = input_tensor.shape[0] * cached_positions * bytes_per_token
+        assert actual_cache_bytes == expected_cache_bytes, "KV payload disagrees with formula"
+        print(f"Final cached positions: {cached_positions}")
+        print(f"KV bytes/token/sequence: {bytes_per_token:,}")
+        print(f"KV payload from tensors: {actual_cache_bytes:,} bytes")
+        print(f"KV payload from formula: {expected_cache_bytes:,} bytes")
+        print(f"KV tensor payload: {actual_cache_bytes / 1024**2:.6f} MiB")
     print(f"Prompt: {prompt}")
     print(f"Tokens: {tokenizer.convert_ids_to_tokens(input_ids)}")
     print(f"Token IDs: {input_ids}")
