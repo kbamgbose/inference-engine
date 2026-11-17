@@ -13,6 +13,28 @@ def synchronize(device):
         torch.mps.synchronize()
 
 
+def prefill(model, prompt_ids):
+    """Process a complete unpadded prompt and return logits plus a fresh KV cache.
+
+    The caller supplies an evaluation-mode model and an inference-mode context.
+    Token selection remains the caller's responsibility.
+    """
+    return model(input_ids=prompt_ids, use_cache=True, return_dict=True)
+
+
+def decode_step(model, token_ids, cache):
+    """Process one uncached token per sequence using the existing KV cache.
+
+    For our single unpadded request, token_ids has shape [1, 1]. The model
+    updates the cache in place and returns logits plus the updated cache.
+    The caller supplies evaluation/inference mode and handles token selection.
+    """
+    return model(
+        input_ids=token_ids, past_key_values=cache,
+        use_cache=True, return_dict=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Naive full-prefix greedy generation")
     parser.add_argument(
@@ -60,7 +82,7 @@ def main():
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         with torch.inference_mode():
-            outputs = model(input_ids=prompt_tensor, use_cache=True, return_dict=True)
+            outputs = prefill(model, prompt_tensor)
         cache = outputs.past_key_values
         assert cache is not None
         assert len(cache.layers) == model.config.n_layer
@@ -82,10 +104,7 @@ def main():
         # Reuse the prompt cache for exactly one new token, then compare scores.
         with torch.inference_mode():
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            cached_outputs = model(
-                input_ids=next_token, past_key_values=cache,
-                use_cache=True, return_dict=True,
-            )
+            cached_outputs = decode_step(model, next_token, cache)
             full_prefix = torch.cat((prompt_tensor, next_token), dim=1)
             reference = model(input_ids=full_prefix, use_cache=False, return_dict=True)
             cached_scores = cached_outputs.logits[:, -1, :]
@@ -132,11 +151,12 @@ def main():
 
             if args.use_kv_cache:
                 # Prefill once; then forward only the token not yet in the cache.
-                model_input = input_tensor if cache is None else input_tensor[:, -1:]
-                outputs = model(
-                    input_ids=model_input, past_key_values=cache,
-                    use_cache=True, return_dict=True,
-                )
+                if cache is None:
+                    model_input = input_tensor
+                    outputs = prefill(model, model_input)
+                else:
+                    model_input = input_tensor[:, -1:]
+                    outputs = decode_step(model, model_input, cache)
                 cache = outputs.past_key_values
                 assert cache is not None
                 assert cache.get_seq_length() == prefix_length
