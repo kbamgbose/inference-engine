@@ -1,5 +1,6 @@
 import argparse
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -8,6 +9,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from inference_engine.benchmark_metadata import collect_metadata
+
+
+def profile_range(name, enabled):
+    """Label CPU scope without adding synchronization or including request content."""
+    return torch.cuda.nvtx.range(name) if enabled else nullcontext()
 
 
 def synchronize(device):
@@ -56,6 +62,7 @@ class GenerationResult:
 
 def generate_tokens(
     model, input_tensor, *, max_new_tokens, use_kv_cache, eos_token_id, request_start,
+    nvtx=False,
 ):
     """Generate for one unpadded request with fresh state and an already loaded model.
 
@@ -88,16 +95,19 @@ def generate_tokens(
                 # Prefill once; then forward only the token not yet in the cache.
                 if cache is None:
                     model_input = input_tensor
-                    outputs = prefill(model, model_input)
+                    with profile_range("prefill", nvtx):
+                        outputs = prefill(model, model_input)
                 else:
                     model_input = input_tensor[:, -1:]
-                    outputs = decode_step(model, model_input, cache)
+                    with profile_range("decode", nvtx):
+                        outputs = decode_step(model, model_input, cache)
                 cache = outputs.past_key_values
                 assert cache is not None
                 assert cache.get_seq_length() == prefix_length
             else:
                 model_input = input_tensor
-                outputs = model(input_ids=model_input, use_cache=False, return_dict=True)
+                with profile_range("full_prefix", nvtx):
+                    outputs = model(input_ids=model_input, use_cache=False, return_dict=True)
                 assert outputs.past_key_values is None
             forwarded_lengths.append(model_input.shape[1])
             logits = outputs.logits
@@ -177,7 +187,13 @@ def main():
         "--device", choices=("cpu", "cuda", "mps"), default="cpu",
         help="Execution backend (default: cpu)",
     )
+    parser.add_argument(
+        "--nvtx", action="store_true",
+        help="Label normal CUDA generation phases for Nsight Systems (default: off)",
+    )
     args = parser.parse_args()
+    if args.nvtx and (args.device != "cuda" or args.inspect_kv_cache):
+        parser.error("--nvtx requires --device cuda and cannot be used with --inspect-kv-cache")
     if not args.prompt:
         parser.error("--prompt must not be empty")
     if args.max_new_tokens < 0:
@@ -271,21 +287,22 @@ def main():
         print("Cached and full-prefix scores agree within tolerance; greedy IDs match")
         return
 
-    for _ in range(args.warmup_runs):
-        warmup_start = perf_counter()
-        warmup_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if not warmup_ids:
-            parser.error("--prompt must encode to at least one token")
-        warmup_input = torch.tensor([warmup_ids], dtype=torch.long, device=device)
-        warmup_result = generate_tokens(
-            model, warmup_input, max_new_tokens=args.max_new_tokens,
-            use_kv_cache=args.use_kv_cache, eos_token_id=tokenizer.eos_token_id,
-            request_start=warmup_start,
-        )
-        tokenizer.decode(
-            warmup_result.output_ids[0].tolist(),
-            skip_special_tokens=True, clean_up_tokenization_spaces=False,
-        )
+    for warmup_index in range(args.warmup_runs):
+        with profile_range(f"warmup/{warmup_index + 1}", args.nvtx):
+            warmup_start = perf_counter()
+            warmup_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            if not warmup_ids:
+                parser.error("--prompt must encode to at least one token")
+            warmup_input = torch.tensor([warmup_ids], dtype=torch.long, device=device)
+            warmup_result = generate_tokens(
+                model, warmup_input, max_new_tokens=args.max_new_tokens,
+                use_kv_cache=args.use_kv_cache, eos_token_id=tokenizer.eos_token_id,
+                request_start=warmup_start, nvtx=args.nvtx,
+            )
+            tokenizer.decode(
+                warmup_result.output_ids[0].tolist(),
+                skip_special_tokens=True, clean_up_tokenization_spaces=False,
+            )
         # Release request tensors/cache; keep the model and reusable allocator blocks.
         del warmup_result, warmup_input, warmup_ids
     print(f"Warm-up requests completed: {args.warmup_runs}")
@@ -298,34 +315,35 @@ def main():
         if device.type == "cuda":
             # Reset the observation window, not allocations: resident weights count.
             torch.cuda.reset_peak_memory_stats(device)
-        request_start = perf_counter()
-        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if not input_ids:
-            parser.error("--prompt must encode to at least one token")
-        # Add the batch dimension: one sequence containing all prompt token IDs.
-        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=model.device)
-        prompt_length = input_tensor.shape[1]
+        with profile_range(f"trial/{trial_index + 1}", args.nvtx):
+            request_start = perf_counter()
+            input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            if not input_ids:
+                parser.error("--prompt must encode to at least one token")
+            # Add the batch dimension: one sequence containing all prompt token IDs.
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=model.device)
+            prompt_length = input_tensor.shape[1]
 
-        result = generate_tokens(
-            model, input_tensor, max_new_tokens=args.max_new_tokens,
-            use_kv_cache=args.use_kv_cache, eos_token_id=tokenizer.eos_token_id,
-            request_start=request_start,
-        )
-        input_tensor = result.output_ids
-        cache = result.cache
-        stop_reason = result.stop_reason
-        trace = result.trace
-        forwarded_lengths = result.forwarded_lengths
-        first_token_seconds = result.first_token_seconds
-        inter_token_seconds = result.inter_token_seconds
-        generation_seconds = result.generation_seconds
+            result = generate_tokens(
+                model, input_tensor, max_new_tokens=args.max_new_tokens,
+                use_kv_cache=args.use_kv_cache, eos_token_id=tokenizer.eos_token_id,
+                request_start=request_start, nvtx=args.nvtx,
+            )
+            input_tensor = result.output_ids
+            cache = result.cache
+            stop_reason = result.stop_reason
+            trace = result.trace
+            forwarded_lengths = result.forwarded_lengths
+            first_token_seconds = result.first_token_seconds
+            inter_token_seconds = result.inter_token_seconds
+            generation_seconds = result.generation_seconds
 
-        output_text = tokenizer.decode(
-            input_tensor[0].tolist(),
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        request_seconds = perf_counter() - request_start
+            output_text = tokenizer.decode(
+                input_tensor[0].tolist(),
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            request_seconds = perf_counter() - request_start
 
         # CUDA allocator peaks during the request, including the resident model.
         peak_allocated_bytes = None
@@ -423,6 +441,7 @@ def main():
             "warmup_runs": args.warmup_runs,
             "requested_trials": args.trials,
             "max_new_tokens": args.max_new_tokens,
+            "nvtx_enabled": args.nvtx,
             "metadata": collect_metadata(
                 model, tokenizer, device, prompt, input_ids, args.revision,
             ),

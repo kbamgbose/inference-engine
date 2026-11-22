@@ -1,0 +1,33 @@
+{
+  "measured_trials": 20,
+  "percentile_method": "linear interpolation at index (n - 1) * q",
+  "request_seconds": {
+    "samples": 20,
+    "p50": 0.06640635500662029,
+    "p99": 0.07756653489661403
+  },
+  "generation_seconds": {
+    "samples": 20,
+    "p50": 0.06613959698006511,
+    "p99": 0.07719918124843389
+  },
+  "first_token_seconds": {
+    "samples": 20,
+    "p50": 0.006796879490138963,
+    "p99": 0.007871783435111865
+  },
+  "pooled_inter_token_seconds": {
+    "samples": 180,
+    "p50": 0.006593495985725895,
+    "p99": 0.00846547911234666
+  },
+  "total_generated_tokens": 200,
+  "total_generation_seconds": 1.3520144606591202,
+  "combined_generation_tokens_per_second": 147.9274118876643,
+  "generated_tokens_min": 10,
+  "generated_tokens_max": 10,
+  "stop_reason_counts": {
+    "generation limit": 20
+  },
+  "interpretation": "Empirical percentiles; small sample counts do not establish tail latency. Throughput excludes preparation, output decoding, and time between trials."
+}
