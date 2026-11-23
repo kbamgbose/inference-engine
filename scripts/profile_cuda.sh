@@ -39,10 +39,19 @@ if [[ $mode == cached ]]; then
     app_args+=(--use-kv-cache)
 fi
 
+capture_env=(env -i "PATH=$PATH" "HOME=$HOME" "HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}")
+# Keep only paths and device selection needed by the profiled process. In
+# particular, do not inherit cloud credentials into Nsight or its child.
+if [[ ${LD_LIBRARY_PATH+x} ]]; then
+    capture_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+fi
+if [[ ${CUDA_VISIBLE_DEVICES+x} ]]; then
+    capture_env+=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+fi
+
 capture=(
-    nsys profile
+    "${capture_env[@]}" nsys profile
     --trace=cuda,nvtx --sample=none --cpuctxsw=none
-    --discard-environment=true
     --capture-range=nvtx --nvtx-capture=trial/1 --capture-range-end=stop
     -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0
     -o "$output_dir/trace"
@@ -56,7 +65,7 @@ if [[ $dry_run == true ]]; then
     exit 0
 fi
 
-# Record only explicit command arguments, not inherited environment variables.
+# Record the explicit launch command; the environment allowlist is visible here.
 printf '%q ' "${capture[@]}" > "$output_dir/command.txt"
 printf '\n' >> "$output_dir/command.txt"
 echo "Capturing $mode request; output directory: $output_dir"

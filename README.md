@@ -147,9 +147,10 @@ calls instead of treating range width as GPU execution time.
 Labels are disabled by default and saved reports record `nvtx_enabled`. Keep
 baseline performance runs unprofiled and without `--nvtx`. The disabled path uses
 a no-op Python context manager; enabling labels adds instrumentation overhead.
-Future Nsight Systems captures should include `--trace=cuda,nvtx` and
-`--discard-environment=true`. Labels contain only phase names and counters, but
-other trace content still needs review before sharing. Local tests can verify
+Future Nsight Systems captures should include `--trace=cuda,nvtx` and launch
+with the restricted environment in `scripts/profile_cuda.sh`. Labels contain
+only phase names and counters, but other trace content still needs review
+before sharing. Local tests can verify
 label nesting with mocked NVTX calls; actual trace visibility requires CUDA.
 
 | Metric | Definition |
@@ -187,8 +188,10 @@ be cached or downloadable on the execution host.
 
 The fixed workload matches the single-request comparison: pinned GPT-2 FP32,
 prompt `The capital of France is`, ten output tokens, three warm-ups, one trial.
-Nsight captures only `trial/1`, with CUDA and NVTX tracing, CPU sampling disabled,
-and environment collection disabled. `NSYS_NVTX_PROFILER_REGISTER_ONLY=0` enables
+Nsight captures only `trial/1`, with CUDA and NVTX tracing and CPU sampling disabled.
+The script launches Nsight with an explicit environment allowlist so cloud
+credentials are not inherited by the profiler or model process.
+`NSYS_NVTX_PROFILER_REGISTER_ONLY=0` enables
 capture-trigger matching for PyTorch's ordinary NVTX strings; this adds profiler
 overhead. No unprofiled benchmark JSON is produced by this capture script.
 
@@ -198,7 +201,8 @@ code and retain the log; a missing/empty expected report also fails. File existe
 does not establish that the trace contains the expected activity. Review it before
 sharing. Environment suppression is not general secret sanitization. Output lives
 on the execution machine: this script does not back it up or guarantee persistence
-when a cloud instance stops.
+when a cloud instance stops. Capture directories are ignored by Git to prevent
+accidental staging of reports that may contain sensitive data.
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v

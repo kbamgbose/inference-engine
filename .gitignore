@@ -208,6 +208,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Nsight capture reports may contain process data or credentials.
+benchmarks/profile_*/
+
 # PyPI configuration file
 .pypirc
 
