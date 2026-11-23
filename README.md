@@ -172,6 +172,34 @@ Synchronization at timing boundaries waits for CUDA/MPS work to finish.
 
 ## Validation and limits
 
+Prepare a focused CUDA capture locally, without a GPU or Nsight installation:
+
+```bash
+bash scripts/profile_cuda.sh cached --dry-run
+bash scripts/profile_cuda.sh uncached --dry-run
+```
+
+Dry runs only print the command. During a later GPU session, activate the project
+environment and run `bash scripts/profile_cuda.sh cached` (or `uncached`). The
+script uses `python` from that environment; `PROFILE_PYTHON` can select another
+interpreter. It does not provision a Pod or install dependencies. The model must
+be cached or downloadable on the execution host.
+
+The fixed workload matches the single-request comparison: pinned GPT-2 FP32,
+prompt `The capital of France is`, ten output tokens, three warm-ups, one trial.
+Nsight captures only `trial/1`, with CUDA and NVTX tracing, CPU sampling disabled,
+and environment collection disabled. `NSYS_NVTX_PROFILER_REGISTER_ONLY=0` enables
+capture-trigger matching for PyTorch's ordinary NVTX strings; this adds profiler
+overhead. No unprofiled benchmark JSON is produced by this capture script.
+
+Each actual run creates a unique `benchmarks/profile_MODE.XXXXXX` directory with
+`trace.nsys-rep`, `capture.log`, and `command.txt`. Failures return a nonzero exit
+code and retain the log; a missing/empty expected report also fails. File existence
+does not establish that the trace contains the expected activity. Review it before
+sharing. Environment suppression is not general secret sanitization. Output lives
+on the execution machine: this script does not back it up or guarantee persistence
+when a cloud instance stops.
+
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
