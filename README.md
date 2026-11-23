@@ -204,6 +204,11 @@ on the execution machine: this script does not back it up or guarantee persisten
 when a cloud instance stops. Capture directories are ignored by Git to prevent
 accidental staging of reports that may contain sensitive data.
 
+After `nsys stats` creates a `trace.sqlite` export, run
+`python scripts/kernel_gaps.py path/to/trace.sqlite` to count kernel-free gaps
+of at least 10 microseconds. This is not whole-GPU idle time: a copy can run
+between kernels, and a gap alone does not identify its cause.
+
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
