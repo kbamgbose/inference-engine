@@ -1,8 +1,5 @@
 # Inference engine
 
-A guided learning baseline for single-request, full-prefix greedy generation.
-The implementation is in `inference_engine/generate_naive.py`.
-
 ## Setup and execution
 
 Use Python 3.10 or newer in a supported PyTorch environment:
